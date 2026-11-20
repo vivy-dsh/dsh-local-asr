@@ -9,6 +9,7 @@ import { createConfigStore } from './store.mjs'
 import { createModelStore } from './model-store.mjs'
 import { createEngineRegistry } from './engine-registry.mjs'
 import { createSensevoiceEngine } from './engine-sensevoice.mjs'
+import { createGatewayEngine } from './engine-gateway.mjs'
 import { createAsrService } from './service.mjs'
 import { registerAsrHttp } from './http.mjs'
 import { createInternalHandler } from './internal.mjs'
@@ -27,6 +28,17 @@ export function apply(ctx) {
   const engines = createEngineRegistry()
   const engine = createSensevoiceEngine({ stateDir, modelStore, getConfig: () => configStore.get(), logger })
   const unregister = engines.register(engine)
+
+  // 世界网关（千问）是第二个引擎：识别交给宿主的 capabilityHub，这边不碰协议与凭据。
+  // 用 inject 订阅而不是 ctx.get：服务由另一个插件的 apply 提供，可能比这里晚就绪。
+  let hub
+  const disposeHub = ctx.inject(['capabilityHub'], child => {
+    hub = child.capabilityHub ?? undefined
+    return () => { hub = undefined }
+  })
+  const gatewayEngine = createGatewayEngine({ getHub: () => hub, logger })
+  const unregisterGateway = engines.register(gatewayEngine)
+
   const { service } = createAsrService({ stateDir, configStore, engines, engine, logger })
 
   const disposeHttp = registerAsrHttp(ctx, service, { logger })
@@ -40,7 +52,7 @@ export function apply(ctx) {
   logger?.info?.(`语音识别已挂载（引擎 ${configStore.get().engine}，状态目录 ${stateDir}）`)
 
   ctx.effect(() => async () => {
-    disposeInternal(); disposeHttp(); unregister()
+    disposeInternal(); disposeHttp(); disposeHub(); unregisterGateway(); unregister()
     await service.dispose()
   })
 }
