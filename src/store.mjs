@@ -26,7 +26,9 @@ const SENSEVOICE_DEFAULTS = {
 }
 const UI_DEFAULTS = { language: 'auto' }
 
-export const ASR_DEFAULTS = { enabled: true, engine: 'sensevoice' }
+// 默认引擎是世界网关（千问）：不用先下几百 MB 模型，填一把 key 就能识别。
+// 旧配置里已经写了 engine 的照旧生效，面板里随时能换回本机 SenseVoice。
+export const ASR_DEFAULTS = { enabled: true, engine: 'gateway' }
 
 /** 非负整数（含 0 = 不限）；非法值回落到默认，不因一个手滑把插件打挂。 */
 function nonNegative(value, fallback) {

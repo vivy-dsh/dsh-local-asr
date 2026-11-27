@@ -14,6 +14,13 @@ import { UnknownEngineError } from './engine-registry.mjs'
 
 const RATE_WINDOW_MS = { minute: 60_000, hour: 3_600_000 }
 
+/**
+ * 这些错误码说明「世界网关这条路现在不通」（缺凭据、没启用、没挂载、上游报错），
+ * 值得落到本地引擎再试一次。音频本身有问题（ASR_AUDIO_*）、限流、超时不在其中——
+ * 换引擎解决不了它们，只会让用户多等一次。
+ */
+const GATEWAY_CODES = new Set(['ASR_GATEWAY_FAILED', 'ASR_GATEWAY_UNAVAILABLE', 'ASR_GATEWAY_NOT_READY'])
+
 function readJson(file, fallback) {
   try { return JSON.parse(readFileSync(file, 'utf8')) } catch (error) { if (error.code === 'ENOENT') return fallback; throw error }
 }
@@ -56,9 +63,25 @@ export function createAsrService({ stateDir, configStore, engines, engine, logge
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
 
   const config = () => configStore.get()
+  /**
+   * 当前该用哪个引擎。
+   *
+   * 配置里写的引擎可能不存在——默认引擎是世界网关，而网关插件没装/没启用时它根本不会注册。
+   * 那时**不能**把「未知引擎」摔给用户：退回第一个已注册的引擎，识别还能用，
+   * 由面板的 `engine` 字段如实显示实际是谁在做。
+   */
   const activeEngine = () => {
     const id = config().engine
-    return id === engine.info.id ? engine : engines.resolve(id)
+    if (id === engine.info.id) return engine
+    try {
+      return engines.resolve(id)
+    } catch (error) {
+      if (!(error instanceof UnknownEngineError)) throw error
+      const fallback = engines.list()[0]
+      if (!fallback) throw error
+      logger?.warn?.(`配置的识别引擎 ${id} 不存在（${error.message}），本次改用 ${fallback.info.id}`)
+      return fallback
+    }
   }
 
   // ── 限流账本：插件是唯一写入方，跨进程读同一份时间戳 ──────────────────────
@@ -241,7 +264,8 @@ export function createAsrService({ stateDir, configStore, engines, engine, logge
     const hint = current.ui.language
     const requested = typeof language === 'string' && language !== '' ? language : hint
     const chosen = engine.info.languages.includes(requested) ? requested : 'auto'
-    const key = fingerprint(bytes)
+    // 缓存键带上引擎 id：换了引擎就该重新识别，不能拿上一个引擎的旧结果糊弄人。
+    const key = `${target.info.id}-${fingerprint(bytes)}`
 
     if (current.cache.enabled) {
       const hit = cacheRead(key)
@@ -255,19 +279,52 @@ export function createAsrService({ stateDir, configStore, engines, engine, logge
     const tempFile = writeTempWave(tmpDir, bytes, randomUUID())
     const started = Date.now()
     try {
-      const result = await target.transcribe({ wavPath: tempFile, language: chosen })
+      let result, used = target, fallback = null
+      try {
+        result = await target.transcribe({ wavPath: tempFile, language: chosen })
+      } catch (error) {
+        const failure = toAsrError(error)
+        // 默认引擎是世界网关，它不可用时落到一个**已就绪**的本地引擎——
+        // 这样新装用户没填 key 也不会一个字都识别不出来。换路必须留痕（fallback + 审计 + 日志）。
+        const backup = GATEWAY_CODES.has(failure.code) ? pickReadyBackup(target.info.id) : null
+        if (!backup) {
+          audit({ source, engine: target.info.id, cached: false, ok: false, audioSeconds: wave.durationSeconds, language: chosen, code: failure.code, error: failure.message, ...(converted ? { converted } : {}) })
+          throw failure
+        }
+        const primaryMessage = failure.message
+        try {
+          const backupLanguage = backup.info.languages.includes(chosen) ? chosen : 'auto'
+          result = await backup.transcribe({ wavPath: tempFile, language: backupLanguage })
+        } catch (second) {
+          const other = toAsrError(second)
+          audit({ source, engine: target.info.id, cached: false, ok: false, audioSeconds: wave.durationSeconds, language: chosen, code: other.code, error: other.message, fallbackFrom: target.info.id, fallbackReason: primaryMessage, ...(converted ? { converted } : {}) })
+          throw new AsrError(`${other.message}（世界网关也失败：${primaryMessage.slice(0, 160)}）`, { code: other.code, hint: other.hint, status: other.status, cause: second })
+        }
+        used = backup
+        fallback = { from: target.info.id, to: backup.info.id, reason: primaryMessage.slice(0, 300) }
+        logger?.warn?.(`世界网关识别失败（${failure.code}）：${primaryMessage.slice(0, 200)}；已回退引擎 ${backup.info.id}`)
+      }
       budgetCommit()
-      const payload = { text: result.text, audioSeconds: result.audioSeconds, inferenceSeconds: result.inferenceSeconds, at: Date.now(), engine: target.info.id, language: chosen }
-      if (current.cache.enabled) cacheWrite(key, payload)
-      audit({ source, engine: target.info.id, cached: false, audioSeconds: result.audioSeconds, inferenceSeconds: result.inferenceSeconds, chars: String(result.text ?? '').length, language: chosen, elapsedMs: Date.now() - started, ...(converted ? { converted } : {}) })
-      return { ok: true, ...payload, cached: false, cacheKey: key, ...(converted ? { converted } : {}) }
-    } catch (error) {
-      const failure = toAsrError(error)
-      audit({ source, engine: target.info.id, cached: false, ok: false, audioSeconds: wave.durationSeconds, language: chosen, code: failure.code, error: failure.message, ...(converted ? { converted } : {}) })
-      throw failure
+      const payload = { text: result.text, audioSeconds: result.audioSeconds, inferenceSeconds: result.inferenceSeconds, at: Date.now(), engine: used.info.id, language: chosen, ...(fallback ? { fallback } : {}) }
+      // 回退来的结果不写缓存：它是替别人跑出来的，不该占掉网关自己的缓存位。
+      if (current.cache.enabled && !fallback) cacheWrite(key, payload)
+      audit({ source, engine: used.info.id, cached: false, audioSeconds: result.audioSeconds, inferenceSeconds: result.inferenceSeconds, chars: String(result.text ?? '').length, language: chosen, elapsedMs: Date.now() - started, ...(fallback ? { fallbackFrom: fallback.from } : {}), ...(converted ? { converted } : {}) })
+      return { ok: true, ...payload, cached: false, ...(fallback ? {} : { cacheKey: key }), ...(converted ? { converted } : {}) }
     } finally {
       try { rmSync(tempFile) } catch {}
     }
+  }
+
+  /**
+   * 世界网关失败时，找第一个**已就绪**的其他引擎兜底。
+   * 只认 `status().ready === true`：没下载模型的 SenseVoice 不该被当成备胎。
+   */
+  function pickReadyBackup(exceptId) {
+    for (const candidate of engines.list()) {
+      if (candidate.info?.id === exceptId) continue
+      try { if (candidate.status?.()?.ready === true) return candidate } catch {}
+    }
+    return null
   }
 
   function status() {
